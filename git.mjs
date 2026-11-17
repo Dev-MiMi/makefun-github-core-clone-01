@@ -145,7 +145,8 @@ export function readPack(body, existing) {
     } else if (!TYPES[type]) throw new Error('Invalid PACK object type');
     const inflated = inflateSync(body.subarray(p, trailer), {
       info: true,
-      maxOutputLength: Math.max(1, size)
+      maxOutputLength: Math.max(1, size),
+      chunkSize: Math.max(64, Math.min(16384, size + 1))
     });
     if (inflated.buffer.length !== size || !inflated.engine.bytesWritten) throw new Error('PACK object size mismatch');
     p += inflated.engine.bytesWritten;

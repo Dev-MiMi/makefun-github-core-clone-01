@@ -45,12 +45,13 @@ test('three-way squash merges independent lines and file modes',()=>{
   assert.throws(()=>mergeText(Buffer.from('a\n'),Buffer.from('b\n'),Buffer.from('c\n')),/conflict/);
 });
 
-function transport(handler){return async(path,method='GET',body,auth='Bearer test')=>{
+function transport(handler){return async(path,method='GET',body,auth='Bearer test',options={})=>{
   const bytes=Buffer.from(typeof body==='string'?body:body===undefined?'':JSON.stringify(body));
-  const req={url:path,method,headers:{host:'forge.test',...(auth?{authorization:auth}:{})},async *[Symbol.asyncIterator](){if(bytes.length)yield bytes;}};
+  const framing=body===undefined?{}:{'content-length':String(bytes.length)};
+  const req={url:path,method,headers:{host:'forge.test',...(auth?{authorization:auth}:{}),...framing,...options.headers},async *[Symbol.asyncIterator](){options.onRead?.();for(const chunk of options.chunks??(bytes.length?[bytes]:[]))yield chunk;}};
   let status=200,text='',headers={};
   const res={statusCode:200,headersSent:false,setHeader(k,v){headers[k]=v;},writeHead(s,h){status=s;headers={...headers,...h};this.headersSent=true;},end(value){text=String(value??'');}};
-  await handler(req,res);return {status:res.statusCode===200?status:res.statusCode,body:text?JSON.parse(text):null,headers};
+  await handler(req,res);return {status:res.statusCode===200?status:res.statusCode,body:text?JSON.parse(text):null,headers,text};
 };}
 test('HTTP handler authentication, errors, and REST/GraphQL/MCP identity agree',async()=>{
   const {store,repo}=fixture(),call=transport(createHandler(store,'test'));
@@ -79,4 +80,62 @@ test('annotated tags expose the same contents and tree as their commit',async()=
   repo.refs.set('refs/tags/v1',tag);const call=transport(createHandler(store,'test'));
   assert.equal(Buffer.from((await call('/api/v3/repos/alice/forge/contents/src/file?ref=v1')).body.content,'base64').toString(),'tagged');
   assert.equal((await call('/api/v3/repos/alice/forge/contents/src?ref=v1')).body[0].name,'file');
+});
+
+test('empty and tiny PACK objects use bounded inflation storage',()=>{
+  assert.equal(readPack(writePack([]),new Map()).size,0);
+  const objects=readPack(writePack([{type:'blob',data:Buffer.alloc(0)},{type:'blob',data:Buffer.from('x')}]),new Map());
+  assert.deepEqual([...objects.values()].map(object=>object.data.length),[0,1]);
+  // Node may share a small-buffer pool; a tiny object must not retain a 16 KiB slab.
+  for(const object of objects.values())assert.ok(object.data.buffer.byteLength<=Math.max(Buffer.poolSize,64));
+  const large=Buffer.alloc(20000,97);
+  assert.deepEqual([...readPack(writePack([{type:'blob',data:large}]),new Map()).values()][0].data,large);
+});
+
+test('OFS deltas retain output validation with small inflation chunks',()=>{
+  const base=Buffer.concat([objectHeader(3,5),deflateSync(Buffer.from('hello'))]);
+  const delta=Buffer.from([5,6,0x90,5,1,33]);
+  const makeDelta=data=>pack([base,Buffer.concat([objectHeader(6,data.length),Buffer.from([base.length]),deflateSync(data)])]);
+  assert.equal([...readPack(makeDelta(delta),new Map()).values()][1].data.toString(),'hello!');
+  assert.throws(()=>readPack(makeDelta(Buffer.from([5,7,0x90,5])),new Map()),/Delta output size mismatch/);
+  assert.throws(()=>readPack(makeDelta(Buffer.from([5,6,0x90])),new Map()),/Truncated delta size/);
+  assert.throws(()=>readPack(makeDelta(Buffer.from([5,6,0x90,6])),new Map()),/Invalid delta copy range/);
+  assert.throws(()=>readPack(makeDelta(Buffer.from([5,0x81,0x80,0x80,0x20])),new Map()),/Delta object too large/);
+});
+
+test('valid-checksum PACKs still reject truncated streams and false sizes',()=>{
+  const zipped=deflateSync(Buffer.from('hello'));
+  assert.throws(()=>readPack(pack([Buffer.concat([objectHeader(3,5),zipped.subarray(0,zipped.length-1)])]),new Map()));
+  assert.throws(()=>readPack(pack([Buffer.concat([objectHeader(3,6),zipped])]),new Map()),/PACK object size mismatch/);
+  assert.throws(()=>readPack(pack([Buffer.concat([objectHeader(3,4),zipped])]),new Map()));
+  assert.throws(()=>readPack(pack([objectHeader(3,64*1024*1024+1)]),new Map()),/PACK object too large/);
+  assert.throws(()=>readPack(pack([Buffer.from([0x80])]),new Map()),/Invalid PACK size/);
+});
+
+test('HTTP body framing reads chunked streams and skips unframed and zero-length requests',async()=>{
+  const {store}=fixture(),call=transport(createHandler(store,'test'));
+  const unread=()=>{throw new Error('An empty request must not collect a body');};
+  assert.equal((await call('/api/v3/user','GET',undefined,'Bearer test',{onRead:unread})).status,200);
+  assert.equal((await call('/api/v3/user','GET',undefined,'Bearer test',{headers:{'content-length':'0'},onRead:unread})).status,200);
+  const bytes=Buffer.from(JSON.stringify({title:'chunked 🌍'}));
+  let reads=0;
+  const result=await call('/api/v3/repos/alice/forge/issues','POST',undefined,'Bearer test',{
+    headers:{'transfer-encoding':'chunked'},chunks:[bytes.subarray(0,bytes.length-3),bytes.subarray(bytes.length-3)],onRead:()=>reads++
+  });
+  assert.equal(result.status,201);assert.equal(result.body.title,'chunked 🌍');assert.equal(reads,1);
+  assert.equal((await call('/api/v3/user','GET',undefined,'Bearer test',{headers:{'transfer-encoding':'chunked'},chunks:[Buffer.from('{')]})).status,400);
+  assert.equal((await call('/api/v3/user','GET',undefined,'Bearer test',{headers:{'content-length':'1'},chunks:[Buffer.from('{')]})).status,400);
+  // A later request through the same handler still sees the completed mutation.
+  assert.equal((await call('/api/v3/repos/alice/forge/issues/'+result.body.number)).body.title,'chunked 🌍');
+});
+
+test('JSON Content-Length describes final UTF-8 bytes, including cached replies and errors',async()=>{
+  const {store}=fixture(),call=transport(createHandler(store,'test'));
+  const issue=await call('/api/v3/repos/alice/forge/issues','POST',{title:'café 🌍',body:'你好'});
+  const path='/api/v3/repos/alice/forge/issues/'+issue.body.number;
+  const replies=[issue,await call(path),await call(path),await call(path,'PATCH',{title:'é'}),await call('/api/v3/未知')];
+  for(const reply of replies)assert.equal(Number(reply.headers['content-length']),Buffer.byteLength(reply.text));
+  assert.ok(Buffer.byteLength(issue.text)>issue.text.length);
+  const deleted=await call('/api/v3/repos/alice/forge','DELETE');
+  assert.equal(deleted.status,204);assert.equal(deleted.text,'');assert.equal(deleted.headers['content-length'],undefined);
 });
