@@ -1,0 +1,9 @@
+# Workspace configuration and private build records are never product files.
+.agents
+.aws
+.codex
+.env
+.env.*
+node_modules/
+*.log
+transcripts*.tar.gz
